@@ -1,0 +1,1 @@
+export function createJobQueue(p:any,options?:{execute?:(p:any,job:any,signal?:AbortSignal)=>Promise<any>}):Promise<{jobs:Map<string,any>;enqueue:(type:string,pageId:string,snapshotId?:string,dependsOn?:string)=>Promise<any>;retry:(id:string)=>Promise<any>;close:()=>any}>

@@ -1,7 +1,6 @@
 import { createServer } from 'node:http'
 import { readFile, mkdir, readdir } from 'node:fs/promises'
 import { join, resolve, extname } from 'node:path'
-import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { paths, readJson, writeJson, validId, compare, summarize, validateDecision, acceptedIssuesPath, validateAcceptedIssues } from './model.mjs'
 import { previewHtml, rewriteCss } from './preview.mjs'
@@ -10,49 +9,17 @@ import { replayPayload } from './replay.mjs'
 import { fingerprintSources } from './driver.mjs'
 import { fileURLToPath } from 'node:url'
 import { extensionRoot } from './adapters/onlytranslate.mjs'
+import { createJobQueue } from './jobs.mjs'
+import { requireSnapshotInput } from './inputs.mjs'
 
 export async function startServer(options = {}) {
   const root=options.root || extensionRoot, p={...paths(root,options.dataRoot),...options.paths}
   for(const dir of [p.data,p.snapshots,p.runs,p.jobs,p.assets,p.decisions])await mkdir(dir,{recursive:true})
   const port=options.port ?? Number(process.env.ONLYTRANSLATE_REVIEW_PORT || 4188)
   const staticRoot=fileURLToPath(new URL('./ui/',import.meta.url))
-  const jobs=new Map(), queue=[], pinTasks=new Map()
-  let busy=false, closing=false, child=null, base, mutation=Promise.resolve()
+  const tasks=await createJobQueue(p),{jobs,enqueue}=tasks,pinTasks=new Map()
+  let base, mutation=Promise.resolve()
   const mutate = work => { const next=mutation.then(work);mutation=next.catch(()=>{});return next }
-  for(const file of (await readdir(p.jobs)).filter(f=>f.endsWith('.json'))){
-    const job=await readJson(join(p.jobs,file))
-    if(job.status==='running'||job.status==='queued'){job.status='interrupted';job.message='服务已重启，请手动重试';await writeJson(join(p.jobs,file),job)}
-    jobs.set(job.id,job)
-  }
-  async function executeQueue(){
-    if(busy||closing)return
-    const id=queue.shift();if(!id)return
-    busy=true
-    const job=jobs.get(id);job.status='running';await writeJson(join(p.jobs,id+'.json'),job)
-    const log=[]
-    child=spawn(process.execPath,[fileURLToPath(new URL('./worker.mjs',import.meta.url)),job.type,job.pageId,id,...(job.snapshotId?[job.snapshotId]:[])],{cwd:root,env:{...process.env,ONLYTRANSLATE_REVIEW_DATA:p.data},windowsHide:true,stdio:['ignore','pipe','pipe']})
-    for(const stream of [child.stdout,child.stderr])stream.on('data',chunk=>{log.push(chunk.toString());if(log.length>100)log.shift()})
-    let finished=false
-    const finish=async(error)=>{
-      if(finished)return
-      finished=true
-      let result=await readJson(join(p.jobs,id+'.json'))
-      if(result.status==='running'){result={...result,status:'failed',message:error||'任务未正常结束'};await writeJson(join(p.jobs,id+'.json'),result)}
-      jobs.set(id,result);busy=false;child=null;executeQueue().catch(console.error)
-    }
-    child.once('error',error=>finish(error.message));child.once('exit',code=>finish(code?'任务失败，见运行状态':undefined))
-  }
-  async function enqueue(type,pageId,snapshotId){
-    if(!['capture','baseline','candidate'].includes(type))throw new Error('未知任务类型')
-    const manifest=await readJson(p.manifest)
-    if(!manifest.pages.some(page=>page.id===pageId))throw new Error('样本不存在')
-    if(snapshotId){if(!validId(snapshotId))throw new Error('无效快照');await readJson(join(p.snapshots,pageId,snapshotId,'snapshot.json'))}
-    const existing=[...jobs.values()].find(job=>job.type===type&&job.pageId===pageId&&(job.snapshotId||null)===(snapshotId||null)&&['running','queued'].includes(job.status))
-    if(existing)return existing
-    const job={id:randomUUID(),type,pageId,...(snapshotId?{snapshotId}:{}),status:'queued',message:'等待运行',createdAt:new Date().toISOString()}
-    jobs.set(job.id,job);await writeJson(join(p.jobs,job.id+'.json'),job);queue.push(job.id)
-    setImmediate(()=>executeQueue().catch(console.error));return job
-  }
   async function allRuns(pageId){
     const folder=join(p.runs,pageId),items=await readdir(folder,{withFileTypes:true}).catch(()=>[])
     return (await Promise.all(items.filter(f=>f.isDirectory()&&validId(f.name)).map(async f=>{const run=await readJson(join(folder,f.name,'run.json'),null);const validation=await readJson(join(folder,f.name,'validation.json'),null);return run&&validation?.valid===false?{...run,status:'invalid',validation}:run}))).filter(Boolean).sort((a,b)=>a.createdAt.localeCompare(b.createdAt))
@@ -99,7 +66,8 @@ export async function startServer(options = {}) {
     const reviewHistory=await loadPageReviews(p.decisions,pageId)
     const pageReview=pageReviewState({snapshot,run:after,history:reviewHistory,decisions,acceptedIssues,specification:policy.annotationPolicyVersion})
     const changed=new Set([...pageReview.addedTextIds,...pageReview.removedTextIds])
-    return {page,snapshot,snapshots,runs,before,after,baselineSelection:selection,blocks:blocks.map(b=>({...b,pageReviewChanged:b.textIds.some(id=>changed.has(id))})),summary:summarize(blocks),decisions,pageReview}
+    const repairs=new Set(pageReview.validation.blockingBlocks)
+    return {page,snapshot,snapshots,runs,before,after,baselineSelection:selection,blocks:blocks.map(b=>({...b,pageReviewChanged:b.textIds.some(id=>changed.has(id)),repairNeeded:repairs.has(b.id)})),summary:summarize(blocks),decisions,pageReview}
   }
   const send=(response,status,value,type='application/json; charset=utf-8')=>{response.writeHead(status,{'Content-Type':type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});response.end(type.startsWith('application/json')?JSON.stringify(value):value)}
   async function body(request){let text='';for await(const part of request){text+=part;if(text.length>2*1024*1024)throw new Error('请求过大')}return JSON.parse(text||'{}')}
@@ -111,21 +79,28 @@ export async function startServer(options = {}) {
         if(request.headers['x-reading-review']!=='1'||!request.headers['content-type']?.startsWith('application/json')||(request.headers.origin&&request.headers.origin!==base))return send(response,403,{error:'无效来源'})
         const input=await body(request)
         if(path==='/api/jobs')return send(response,202,await enqueue(input.type,input.pageId,input.snapshotId))
+        const retryJob=/^\/api\/jobs\/([^/]+)\/retry$/.exec(path)
+        if(retryJob)return send(response,202,await tasks.retry(retryJob[1]))
         if(path==='/api/candidate-all'){
           const queued=[],skipped=[]
           for(const page of (await readJson(p.manifest)).pages){const latest=await readJson(join(p.snapshots,page.id,'latest.json'),null);if(latest)queued.push(await enqueue('candidate',page.id,latest.id));else skipped.push({pageId:page.id,reason:'尚未采集'})}
           return send(response,202,{queued,skipped})
         }
         if(path==='/api/pilot'){
-          const created=[]
+          const created=[],skipped=[]
           for(const page of (await readJson(p.manifest)).pages){
             const latest=await readJson(join(p.snapshots,page.id,'latest.json'),null)
-            if(!latest){for(const type of ['capture','baseline','candidate'])created.push(await enqueue(type,page.id));continue}
+            if(!latest){
+              const previous=[...jobs.values()].filter(j=>j.pageId===page.id&&j.type==='capture').sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0]
+              if(previous?.requestedUrl===page.url&&(['INPUT_BLOCKED','INPUT_INTERACTION_REQUIRED'].includes(previous.error?.code)||(previous.error?.httpStatus>=400&&previous.error.httpStatus<500))){skipped.push({pageId:page.id,reason:'上次采集为受限输入，请核对网址或手动重试'});continue}
+              const capture=await enqueue('capture',page.id);created.push(capture);for(const type of ['baseline','candidate'])created.push(await enqueue(type,page.id,undefined,capture.id));continue
+            }
+            try{await requireSnapshotInput(p,page.id,latest.id)}catch(error){skipped.push({pageId:page.id,reason:error.message});continue}
             const runs=(await allRuns(page.id)).filter(r=>r.snapshotId===latest.id&&r.status==='complete')
             if(!runs.some(r=>r.kind==='baseline'))created.push(await enqueue('baseline',page.id,latest.id))
             if(!runs.some(r=>r.kind==='candidate'))created.push(await enqueue('candidate',page.id,latest.id))
           }
-          return send(response,202,created)
+          return send(response,202,{queued:created,skipped})
         }
         if(path==='/api/pages')return await mutate(async()=>{
           const parsed=new URL(input.url)
@@ -174,6 +149,7 @@ export async function startServer(options = {}) {
             const policy=await readJson(resolve(p.decisions,'../check-policy.json'))
             const acceptedIssues=validateAcceptedIssues(await readJson(acceptedIssuesPath(p.decisions),{schemaVersion:1,issues:[]}))
             record=createPageReview({snapshot:d.snapshot,run:d.after,history,decisions:d.decisions,acceptedIssues,specification:policy.annotationPolicyVersion})
+            if(record.inputHash!==input.inputHash||record.contextHash!==input.contextHash||record.observedCoverageHash!==input.coverageHash)conflict('保存期间页面、识别结果或人工标注发生变化，请刷新后重新评审')
           }
           await writeJson(pageReviewFile(p.decisions,d.page.id),[...history,record])
           return send(response,201,record)
@@ -203,6 +179,13 @@ export async function startServer(options = {}) {
       }
       if(request.method!=='GET')return send(response,405,{error:'不支持的方法'})
       if(path==='/favicon.ico'){response.writeHead(204);return response.end()}
+      const jobLog=/^\/api\/jobs\/([^/]+)\/log$/.exec(path)
+      if(jobLog){
+        const id=jobLog[1];if(!validId(id)||!jobs.has(id))return send(response,404,{error:'任务不存在'})
+        const job=await readJson(join(p.jobs,id+'.json'))
+        const tail=async name=>{try{return (await readFile(join(p.jobs,id,name),'utf8')).slice(-24000)}catch(error){if(error.code==='ENOENT')return '';throw error}}
+        return send(response,200,{job,error:job.error||null,stdout:await tail('stdout.log'),stderr:await tail('stderr.log'),truncatedTo:24000})
+      }
       if(path==='/api/state'){
         const manifest=await readJson(p.manifest),pages=[]
         for(const item of manifest.pages){const d=await detail(item.id);pages.push({...item,snapshotId:d.snapshot?.id,resourceWarnings:d.snapshot?.omittedAssets||0,summary:d.summary,pageReview:d.pageReview,before:d.before?{id:d.before.id,status:d.before.status,targets:d.before.targets.length,translation:d.before.translation}:null,after:d.after?{id:d.after.id,targets:d.after.targets.length}:null})}
@@ -242,7 +225,7 @@ export async function startServer(options = {}) {
   await new Promise((accept,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',accept)})
   base='http://127.0.0.1:'+server.address().port
   console.log(`识文评审台 ${base}\n本地数据 ${p.data}`)
-  return {server,base,paths:p,close:async()=>{closing=true;child?.kill();await new Promise(resolve=>server.close(resolve))}}
+  return {server,base,paths:p,close:async()=>{tasks.close();await new Promise(resolve=>server.close(resolve))}}
 }
 if(process.argv[1]===import.meta.filename){
   const app=await startServer()

@@ -7,7 +7,9 @@ import { installCatalogue } from './catalogue.mjs'
 import { replayPayload as loadReplayPayload, replayCode } from './replay.mjs'
 import { saveCapturedSnapshot, saveBaselineRun } from './archive.mjs'
 import { prepareReleaseInputs } from './release.mjs'
-import { translationCoverage } from './completion.mjs'
+import { assessTranslation } from './completion.mjs'
+import { pageInputIssue, requireSnapshotInput } from './inputs.mjs'
+import { toolError, errorRecord } from './errors.mjs'
 import { extensionRoot } from './adapters/onlytranslate.mjs'
 
 const root = extensionRoot
@@ -17,7 +19,9 @@ const [action, pageId, jobId, requestedSnapshot] = process.argv.slice(2)
 if (!['capture', 'baseline', 'candidate'].includes(action) || !validId(pageId) || !validId(jobId)) throw new Error('无效任务')
 if(requestedSnapshot&&!validId(requestedSnapshot))throw new Error('无效快照编号')
 const jobPath = join(p.jobs, jobId + '.json')
-const progress = async message => { console.log(message); const job = await readJson(jobPath); await writeJson(jobPath, { ...job, message, updatedAt: new Date().toISOString() }) }
+process.env.ONLYTRANSLATE_REVIEW_JOB_LOG ||= join(p.jobs,jobId,'commands')
+let phase=action
+const progress = async (message,details={}) => { console.log(message); const job = await readJson(jobPath);phase=details.phase||phase;const now=new Date().toISOString(); await writeJson(jobPath, { ...job, ...details,phase,message,updatedAt:now,lastProgressAt:message!==job.message?now:job.lastProgressAt }) }
 const pageInfo = (await readJson(p.manifest)).pages.find(page=>page.id === pageId)
 if (!pageInfo) throw new Error('样本不存在')
 
@@ -38,7 +42,7 @@ async function capturePage() {
         const response=await tab.goto(${JSON.stringify(pageInfo.url)},{waitUntil:'domcontentloaded',timeout:45000});
         if(!response?.ok()) throw new Error('HTTP '+response?.status());
         await tab.locator(${JSON.stringify(pageInfo.ready || 'body')}).first().waitFor({state:'visible',timeout:20000});
-        const title=await tab.title(); if(/^(?:just a moment|access denied|attention required|verify|request for access)/i.test(title)) throw new Error('采集到访问验证页');
+        const title=await tab.title(),issue=(${pageInputIssue.toString()})(title,await tab.locator('body').innerText());if(issue)throw new Error('INPUT_BLOCKED: '+issue);
         await tab.waitForTimeout(1200);
         let bottom=false;
         for(let i=0;i<160;i++){bottom=await tab.evaluate(()=>{if(scrollY+innerHeight>=document.documentElement.scrollHeight-3)return true;scrollBy(0,innerHeight*.8);return false;}); if(bottom)break;await tab.waitForTimeout(120);}
@@ -69,61 +73,72 @@ async function prepareRelease() {
 }
 
 async function baseline(snapshot) {
-  await progress('核验发布包并准备发布版识别采集器')
+  await progress('核验发布包并准备发布版识别采集器',{phase:'prepare-release'})
   const {release,extension,build,bundle}=await prepareRelease()
   const browser=await browserConfig(p,extension)
   await openBrowser(browser)
-  const runId='release-'+Date.now()+'-'+randomUUID().slice(0,6), runFolder=join(p.runs,pageId,runId)
+  const runId='release-'+Date.now()+'-'+randomUUID().slice(0,6),runFolder=join(p.runs,pageId,runId)
   await mkdir(runFolder,{recursive:true})
-  try {
+  try{
     const payload=await replayPayload(snapshot,bundle)
-    await progress('发布版正在真实翻译，等待全部目标处理完成')
+    await progress('回放有效快照并检查翻译按钮',{phase:'replay'})
     const initial=await runBrowser(browser,`async page=>{
       const ctx=page.context();const worker=ctx.serviceWorkers().find(w=>w.url().startsWith('chrome-extension:'))||await ctx.waitForEvent('serviceworker',{timeout:15000});
       const settings=${JSON.stringify(release.settings)};
-      const actualVersion=await worker.evaluate(async settings=>{const data=await chrome.storage.local.get('config');const previous=typeof data.config==='string'?JSON.parse(data.config):{};await chrome.storage.local.set({config:JSON.stringify({...previous,...settings})});return chrome.runtime.getManifest().version;},settings);
-      if('v'+actualVersion!==${JSON.stringify(release.tag)})throw new Error('运行中的扩展版本不一致');
+      const actual=await worker.evaluate(async settings=>{const data=await chrome.storage.local.get('config');const previous=typeof data.config==='string'?JSON.parse(data.config):{};const config={...previous,...settings};await chrome.storage.local.set({config:JSON.stringify(config)});return {version:chrome.runtime.getManifest().version,settings:{from:config.from,to:config.to,bidirectionalTranslation:Boolean(config.bidirectionalTranslation),bidirectionalTarget:config.bidirectionalTarget||''}};},settings);
+      if('v'+actual.version!==${JSON.stringify(release.tag)})throw new Error('运行中的扩展版本不一致');
       ${replayCode(payload)}
       const result=await page.evaluate(()=>window.collectReadingReview());
+      const execution=await page.evaluate(settings=>window.readReadingReviewExecution(settings),actual.settings);
       await page.getByTestId('floating-ball-trigger').waitFor({state:'visible',timeout:20000});
-      await page.getByTestId('floating-ball-trigger').click();
+      try{await page.getByTestId('floating-ball-trigger').click({trial:true,timeout:5000});await page.getByTestId('floating-ball-trigger').click({timeout:5000});}
+      catch(error){throw new Error('INPUT_INTERACTION_REQUIRED: 翻译按钮被遮挡或不可点击。'+error.message);}
       await page.waitForTimeout(1500);
-      return {...result,actualVersion};
+      return {...result,execution,executionSettings:actual.settings,actualVersion:actual.version};
     }`)
-    let observation, covered, stable=0
-    const started=Date.now()
+    let observation,assessment,stable=0,signature='',stopReason='deadline'
+    const started=Date.now();let lastProgress=started
     while(Date.now()-started<240000){
       observation=await runBrowser(browser,`async page=>{
         await page.waitForTimeout(1000);
         return await page.evaluate(()=>{
           const state=window.__readingReview;
-          const items=state.nodes.map((node,index)=>({id:'target-'+index,attempted:node.hasAttribute('data-fr-translated'),translation:[...node.querySelectorAll('.only-translate-bilingual-text')].map(n=>n.textContent).join('\\n')}));
+          const items=state.nodes.map((node,index)=>({id:'target-'+index,attempted:node.hasAttribute('data-fr-translated'),connected:node.isConnected,
+            pending:Boolean(node.querySelector('.only-translate-loading')),failed:node.matches('.only-translate-failure')||Boolean(node.querySelector('.only-translate-failure,.only-translate-retry-wrapper')),
+            translation:[...node.querySelectorAll('.only-translate-bilingual-text')].map(n=>n.textContent).join('\\n')}));
           const hosts=[...document.querySelectorAll('[data-fr-translated="true"]')];
-          const unexpectedTargets=hosts.filter(node=>!state.nodes.includes(node)).map((node,index)=>({...state.recordTarget(node,state.nodes.length+index),translation:[...node.querySelectorAll('.only-translate-bilingual-text')].map(n=>n.textContent).join('\\n')}));
+          const unexpectedTargets=hosts.filter(node=>!state.nodes.includes(node)).map((node,index)=>({...state.recordTarget(node,state.nodes.length+index),
+            pending:Boolean(node.querySelector('.only-translate-loading')),failed:node.matches('.only-translate-failure')||Boolean(node.querySelector('.only-translate-failure,.only-translate-retry-wrapper')),
+            translation:[...node.querySelectorAll('.only-translate-bilingual-text')].map(n=>n.textContent).join('\\n')}));
           return {items,unexpectedTargets,unexpectedHosts:unexpectedTargets.length,actualHosts:hosts.length,pending:document.querySelectorAll('.only-translate-loading').length,failures:document.querySelectorAll('.only-translate-failure,.only-translate-retry-wrapper').length,inserted:document.querySelectorAll('.only-translate-bilingual-text').length,attempted:items.filter(i=>i.attempted).length};
         });
       }`)
-      covered=translationCoverage(initial.targets,observation)
-      const done=covered.coverageComplete&&observation.pending===0
-      stable=done?stable+1:0
-      await progress(`实翻 ${observation.attempted}/${initial.targets.length}，原文覆盖 ${covered.coveredTargets}/${initial.targets.length}，译文 ${observation.inserted}，处理中 ${observation.pending}，失败 ${observation.failures}`)
-      if(stable>=3)break
+      assessment=assessTranslation(initial.targets,observation,initial.execution)
+      const next=JSON.stringify([assessment.counts,assessment.coveredTargets,observation.pending,observation.failures,observation.inserted])
+      if(next!==signature){signature=next;lastProgress=Date.now()}
+      stable=assessment.settled?stable+1:0
+      await progress(`译文覆盖 ${assessment.coveredTargets}/${initial.targets.length}，已处理 ${assessment.processedTargets}，译文 ${observation.inserted}，待核实 ${assessment.counts['unverified-completion']||0}，跳过 ${assessment.skipped}，不支持 ${assessment.unsupported}，等待 ${assessment.waiting}，处理中 ${observation.pending}，失败 ${observation.failures}`,
+        {phase:'translate',progress:{covered:assessment.coveredTargets,processed:assessment.processedTargets,unverified:assessment.counts['unverified-completion']||0,expected:initial.targets.length,inserted:observation.inserted,skipped:assessment.skipped,unsupported:assessment.unsupported,waiting:assessment.waiting,pending:observation.pending,failures:observation.failures}})
+      if(stable>=3){stopReason=assessment.complete?'complete':observation.failures?'translation-failures':'limited';break}
+      if(observation.pending===0&&Date.now()-lastProgress>=30000){stopReason='no-progress';break}
     }
-    const complete=stable>=3&&observation.failures===0
+    const complete=stable>=3&&assessment.complete
     const sourceTexts=new Map(snapshot.catalogue.texts.map(text=>[text.id,text.text]))
     const observedTargets=observation.unexpectedTargets.filter(target=>target.textIds.length).map(target=>({...target,text:target.textIds.map(id=>sourceTexts.get(id)||'').join(' '),observedText:target.text}))
     const result={schemaVersion:1,id:runId,pageId,snapshotId:snapshot.id,createdAt:new Date().toISOString(),kind:'baseline',build:initial.build,bundleHash:hash(bundle),status:complete?'complete':'incomplete',actualVersion:initial.actualVersion,
-      targets:[...initial.targets.map((target,i)=>({...target,...observation.items[i],translationStatus:observation.items[i].translation?'inserted':'processed-without-insert'})),...observedTargets],elapsedMs:initial.elapsedMs,stats:initial.stats,
-      translation:{service:release.settings.service,targetLanguage:release.settings.to,elapsedMs:Date.now()-started,expected:initial.targets.length,actualHosts:observation.actualHosts,unexpectedHosts:observation.unexpectedHosts,attempted:observation.attempted,...covered,completionRule:'source-coverage-v1',completionRuleHash,inserted:observation.inserted,pending:observation.pending,failures:observation.failures,complete}}
+      targets:[...initial.targets.map((target,i)=>({...target,...observation.items[i],execution:initial.execution[i],translationStatus:assessment.outcomes[i]})),...observedTargets],elapsedMs:initial.elapsedMs,stats:initial.stats,
+      translation:{service:release.settings.service,targetLanguage:release.settings.to,executionSettings:initial.executionSettings,elapsedMs:Date.now()-started,expected:initial.targets.length,actualHosts:observation.actualHosts,unexpectedHosts:observation.unexpectedHosts,attempted:observation.attempted,...assessment,
+        executionSettled:stable>=3,stopReason,completionRule:'translation-evidence-v3',completionRuleHash,inserted:observation.inserted,pending:observation.pending,failures:observation.failures,complete}}
     await saveBaselineRun(runFolder,result,async()=>{
       const html=await runBrowser(browser,'async page=>({html:await page.content()})')
       await writeFile(join(runFolder,'translated.html'),html.html)
-      await progress('保存实翻页面及全页截图，目标和译文记录已落盘')
-      try { await runBrowser(browser,`async page=>{await page.screenshot({path:${JSON.stringify(join(runFolder,'translated.png'))},fullPage:true,animations:'disabled',timeout:60000});return true;}`) }
-      catch(error) { throw new Error('全页实翻截图失败，目标及译文已保留：'+error.message) }
+      await progress('保存实翻页面及全页截图，目标和译文记录已落盘',{phase:'archive'})
+      try{await runBrowser(browser,`async page=>{await page.screenshot({path:${JSON.stringify(join(runFolder,'translated.png'))},fullPage:true,animations:'disabled',timeout:60000});return true;}`)}
+      catch(error){throw toolError('ARTIFACT_FAILED','全页实翻截图失败，目标及译文已保留：'+error.message,{cause:errorRecord(error,'screenshot'),result:{runId,pageId,snapshotId:snapshot.id}})}
     })
-    if(!complete)throw new Error('实翻未完整完成，已保留运行结果，不能作为合格基线')
-    return {runId,pageId,snapshotId:snapshot.id}
+    const reference={runId,pageId,snapshotId:snapshot.id}
+    if(!complete&&stopReason!=='limited')throw toolError('TRANSLATION_INCOMPLETE',`实翻未完整完成（${stopReason}），已保留结果；覆盖 ${assessment.coveredTargets}/${initial.targets.length}`,{stage:'translate',result:reference})
+    return {...reference,...(!complete?{limited:true,message:`观测已结束：覆盖 ${assessment.coveredTargets}/${initial.targets.length}，跳过 ${assessment.skipped}，不支持 ${assessment.unsupported}；不是合格实翻基线`}:{})}
   }finally{await closeBrowser(browser)}
 }
 
@@ -149,12 +164,14 @@ try {
   if(action==='capture') result=await capturePage()
   else {
     const latest=requestedSnapshot?{id:requestedSnapshot}:await readJson(join(p.snapshots,pageId,'latest.json'))
-    const snapshot=await readJson(join(p.snapshots,pageId,latest.id,'snapshot.json'))
+    const snapshot=await requireSnapshotInput(p,pageId,latest.id)
     result=action==='baseline'?await baseline(snapshot):await candidate(snapshot)
   }
-  await writeJson(jobPath,{...await readJson(jobPath),status:'complete',message:'完成',result,finishedAt:new Date().toISOString()})
+  await writeJson(jobPath,{...await readJson(jobPath),status:result.limited?'limited':'complete',message:result.message||'完成',result,finishedAt:new Date().toISOString()})
 }catch(error){
   console.error(error.stack)
-  await writeJson(jobPath,{...await readJson(jobPath),status:'failed',message:error.message,finishedAt:new Date().toISOString()})
+  const record=errorRecord(error,phase);await writeJson(join(p.jobs,jobId,'error.json'),record)
+  const blocked=['MISSING_SNAPSHOT','INVALID_SNAPSHOT','INPUT_BLOCKED','INPUT_INTERACTION_REQUIRED'].includes(error.code)
+  await writeJson(jobPath,{...await readJson(jobPath),status:blocked?'blocked':'failed',message:error.message,error:record,...(error.details?.result?{result:error.details.result}:{}),finishedAt:new Date().toISOString()})
   process.exitCode=1
 }

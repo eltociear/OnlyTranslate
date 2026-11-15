@@ -73,7 +73,8 @@ it('persists confirmation, rejects stale clicks, and exposes only changed blocks
   await f.saveRun([{textIds:['t1','t2','t3']}])
   expect((await f.post(current)).status).toBe(409)
   const changed=await f.get()
-  expect(changed.pageReview).toMatchObject({state:'needs-review',addedTextIds:['t3'],removedTextIds:[]})
+  // Review completion is retained; the algorithm's new difference is a separate failing check.
+  expect(changed.pageReview).toMatchObject({state:'confirmed',needsSave:true,validation:{state:'violations'},addedTextIds:['t3'],removedTextIds:[]})
   expect(changed.blocks.filter((b:any)=>b.pageReviewChanged).map((b:any)=>b.id)).toEqual(['e2'])
   expect((await f.post(changed)).status).toBe(201)
   expect((await f.get()).pageReview.state).toBe('confirmed')
@@ -126,7 +127,7 @@ it('requires review of a new snapshot but still checks the previously confirmed 
   await writeFile(join(f.data,'snapshots/sample/snapshot-2/source.html'),f.html)
   await writeJson(join(f.data,'snapshots/sample/latest.json'),{id:other.id})
   await f.saveRun([{textIds:['t1','t2']}],{snapshotId:other.id})
-  expect((await f.get()).pageReview).toMatchObject({state:'needs-review',label:'新快照待确认'})
+  expect((await f.get()).pageReview).toMatchObject({state:'needs-review',label:'新快照待评审'})
   const report=await checkCorpus(f.checkOptions)
   expect(report.ok).toBe(true)
   expect(report.pages[0].snapshotId).toBe(f.snapshot.id)
@@ -138,7 +139,7 @@ it('keeps accepted unmet verdicts and blocks stale review context rather than us
   const f=await fixture()
   const decision={id:'decision-1',snapshotId:f.snapshot.id,blockId:'e2',textHash:hash('Subscribe'),verdict:'translate',confirmed:true,reviewer:'user',specification:1,note:'test'}
   await writeJson(join(f.corpus,'decisions/sample.json'),[decision])
-  expect((await f.get()).pageReview.canConfirm).toBe(false)
+  expect((await f.get()).pageReview.canConfirm).toBe(true)
   const issue={id:'issue-1',pageId:'sample',snapshotId:f.snapshot.id,blockId:'e2',decisionId:decision.id,specification:1,expectedVerdict:'translate',htmlHash:f.snapshot.htmlHash,textHash:decision.textHash,acceptedSelectedTextIds:[],status:'accepted',revision:1,reviewer:'user',confirmedAt:'2026-11-14',reason:'isolated test acceptance'}
   await writeJson(join(f.corpus,'accepted-issues.json'),{schemaVersion:1,issues:[issue]})
   expect((await f.post(await f.get())).status).toBe(201)
@@ -177,4 +178,108 @@ it('rejects cross-origin confirmation and makes block-policy changes require a f
   expect((await checkCorpus(f.checkOptions)).ok).toBe(false)
   expect((await f.post(await f.get())).status).toBe(201)
   expect((await checkCorpus(f.checkOptions)).ok).toBe(true)
+})
+
+function label(f:Awaited<ReturnType<typeof fixture>>,blockId:string,verdict:string){
+  return {id:'decision-'+blockId,snapshotId:f.snapshot.id,blockId,textHash:hash(f.snapshot.catalogue.blocks.find(b=>b.id===blockId)!.text),verdict,
+    confirmed:verdict!=='pending',reviewer:'user',specification:1,note:'isolated regression'}
+}
+
+it('completes a page with an excluded mistake, preserves unmarked correct text and still blocks builds',async()=>{
+  const f=await fixture(),decision=label(f,'e2','exclude'),path=join(f.corpus,'decisions/sample.json')
+  await writeJson(path,[decision]);await f.saveRun([{textIds:['t1','t2','t3']}])
+  const before=await f.get()
+  expect(before.pageReview).toMatchObject({canConfirm:true,validation:{state:'violations',blockingBlocks:['e2']}})
+  expect((await f.post(before)).status).toBe(201)
+  const history=JSON.parse(await readFile(f.historyPath,'utf8')),review=history[0]
+  expect(review).toMatchObject({schemaVersion:2,selectedTextIds:['t1','t2'],observedSelectedTextIds:['t1','t2','t3'],unconstrainedTextIds:[]})
+  expect((await f.get()).pageReview).toMatchObject({state:'confirmed',needsSave:false,validation:{state:'violations',blockingBlocks:['e2']}})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2','t3']}]})
+  expect(await checkCorpus(f.checkOptions)).toMatchObject({ok:false,blockingViolations:1,pageReviewBlockingViolations:1})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2']}]})
+  expect(await checkCorpus(f.checkOptions)).toMatchObject({ok:true,pageReviewsSatisfied:1})
+  expect(JSON.parse(await readFile(f.historyPath,'utf8'))).toEqual(history)
+  expect(JSON.parse(await readFile(path,'utf8'))).toEqual([decision])
+})
+
+it('adds all missing text from a translate label and accepts a later repair without another review',async()=>{
+  const f=await fixture(),decision=label(f,'e1','translate')
+  await writeJson(join(f.corpus,'decisions/sample.json'),[decision]);await f.saveRun([{textIds:['t1','t3']}])
+  expect((await f.post(await f.get())).status).toBe(201)
+  const history=JSON.parse(await readFile(f.historyPath,'utf8'))
+  expect(history[0]).toMatchObject({selectedTextIds:['t1','t2','t3'],observedSelectedTextIds:['t1','t3']})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t3']}]})
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(false)
+  await f.saveRun([{textIds:['t1','t2','t3']}])
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2','t3']}]})
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(true)
+  expect((await f.get()).pageReview).toMatchObject({state:'confirmed',needsSave:false,validation:{state:'passed'}})
+  expect(JSON.parse(await readFile(f.historyPath,'utf8'))).toEqual(history)
+})
+
+it.each(['either','pending'])('keeps %s blocks flexible without weakening unmarked expectations',async verdict=>{
+  const f=await fixture(),decision=label(f,'e2',verdict)
+  await writeJson(join(f.corpus,'decisions/sample.json'),[label(f,'e2','translate'),decision])
+  expect((await f.post(await f.get())).status).toBe(201)
+  const review=JSON.parse(await readFile(f.historyPath,'utf8'))[0]
+  expect(review.unconstrainedTextIds).toEqual(['t3'])
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2','t3']}]})
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(true)
+  await f.saveRun([{textIds:['t1','t2','t3']}])
+  expect((await f.get()).pageReview).toMatchObject({state:'confirmed',needsSave:false,validation:{state:'passed'}})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t3']}]})
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(false)
+})
+
+it('preserves the exact accepted exception in full-page expectations, while changed partial coverage still blocks',async()=>{
+  const f=await fixture(),decision=label(f,'e1','translate')
+  await writeJson(join(f.corpus,'decisions/sample.json'),[decision]);await f.saveRun([])
+  const issue={id:'issue-exact',pageId:'sample',snapshotId:f.snapshot.id,blockId:'e1',decisionId:decision.id,specification:1,expectedVerdict:'translate',
+    htmlHash:f.snapshot.htmlHash,textHash:decision.textHash,acceptedSelectedTextIds:[],status:'accepted',revision:1,reviewer:'user',confirmedAt:'2026-11-14',reason:'isolated accepted coverage'}
+  const accepted={schemaVersion:1,issues:[issue]},path=join(f.corpus,'accepted-issues.json')
+  await writeJson(path,accepted);expect((await f.post(await f.get())).status).toBe(201)
+  expect(JSON.parse(await readFile(f.historyPath,'utf8'))[0].selectedTextIds).toEqual(['t1','t2'])
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[]})
+  expect(await checkCorpus(f.checkOptions)).toMatchObject({ok:true,pageReviewsSatisfied:0,pageReviewViolations:1,pageReviewAcceptedIssues:1,pageReviewBlockingViolations:0})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1']}]})
+  expect(await checkCorpus(f.checkOptions)).toMatchObject({ok:false,pageReviewBlockingViolations:1,acceptedIssues:0})
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2']}]})
+  expect(await checkCorpus(f.checkOptions)).toMatchObject({ok:true,pageReviewsSatisfied:1,violations:0})
+  expect(JSON.parse(await readFile(path,'utf8'))).toEqual(accepted)
+})
+
+it('reads v1 expectations without migration and only appends v2 on an explicit completion',async()=>{
+  const f=await fixture(),legacy={...f.approve(),schemaVersion:1}
+  f.runner.build.sourceHash=f.build.sourceHash
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),build:f.runner.build})
+  for(const key of ['observedSelectedTextIds','observedCoverageHash','unconstrainedTextIds','expectationHash'])delete legacy[key]
+  await writeJson(f.historyPath,[legacy]);expect((await f.get()).pageReview.state).toBe('confirmed')
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(true)
+  expect(JSON.parse(await readFile(f.historyPath,'utf8'))).toEqual([legacy])
+  await f.saveRun([{textIds:['t1','t2','t3']}])
+  f.runner.replay.mockResolvedValue({...await f.runner.replay(),targets:[{textIds:['t1','t2','t3']}]})
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(false)
+  expect((await f.post(await f.get())).status).toBe(201)
+  const history=JSON.parse(await readFile(f.historyPath,'utf8'))
+  expect(history[0]).toEqual(legacy);expect(history[1].schemaVersion).toBe(2)
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(true)
+})
+
+it('rejects a forged flexible mask instead of allowing it to waive unmarked expectations',async()=>{
+  const f=await fixture(),review={...f.approve(),unconstrainedTextIds:['t1','t2']}
+  review.expectationHash=hash(JSON.stringify([review.selectedTextIds,review.unconstrainedTextIds]))
+  await writeJson(f.historyPath,[review]);f.runner.replay.mockClear()
+  expect((await f.get()).pageReview.canConfirm).toBe(false)
+  expect((await checkCorpus(f.checkOptions)).ok).toBe(false)
+  expect(f.runner.replay).not.toHaveBeenCalled()
+})
+
+it.each(['unknown','invalid-pending'])('does not turn a malformed %s label into a flexible exemption',async kind=>{
+  const f=await fixture(),decision=label(f,'e2',kind==='unknown'?'unknown':'pending')
+  if(kind==='invalid-pending')decision.confirmed=true
+  await writeJson(join(f.corpus,'decisions/sample.json'),[decision])
+  const d=await f.get()
+  expect(d.pageReview.canConfirm).toBe(false)
+  expect((await f.post(d)).status).toBe(400)
+  await expect(readFile(f.historyPath)).rejects.toMatchObject({code:'ENOENT'})
 })

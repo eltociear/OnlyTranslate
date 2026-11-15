@@ -1,0 +1,41 @@
+[
+  {
+    "blockId": "e37",
+    "snapshotId": "a15d480469e97ea9cf14c64f",
+    "textHash": "648d79b510856e375271b982e22054b78b565aae61e972e47c13fdb65fe51d82",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-14T13:47:32.814Z",
+    "id": "10108b8a-a0ad-43ee-a4d9-baeb2f283c7c",
+    "revision": 1
+  },
+  {
+    "blockId": "e45",
+    "snapshotId": "a15d480469e97ea9cf14c64f",
+    "textHash": "b67219503f4a549285a37709cce7833b87466a3ad938a80f325cdb0459174eda",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-14T13:47:32.814Z",
+    "id": "055c0dfb-a1c0-4c3a-a63f-2dede98fc265",
+    "revision": 2
+  },
+  {
+    "blockId": "e48",
+    "snapshotId": "a15d480469e97ea9cf14c64f",
+    "textHash": "e2aa43048422ba39ce20c4870f267518835f5b0ee99efca1e042373d9802c0f3",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-14T13:47:32.814Z",
+    "id": "f463b452-771d-42de-84c4-79344489f93c",
+    "revision": 3
+  }
+]

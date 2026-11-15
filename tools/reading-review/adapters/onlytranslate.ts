@@ -1,8 +1,21 @@
 import { getTranslatableText } from '@/entrypoints/main/dom'
 import { resolveAutoTranslationTarget } from '@/entrypoints/main/translationTarget/collect'
+import { detectlang } from '@/entrypoints/utils/common'
 declare const __REVIEW_BUILD__: object
 
-Object.assign(window, { collectReadingReview: () => {
+Object.assign(window, { readReadingReviewExecution: (settings: { to: string; bidirectionalTranslation?: boolean; bidirectionalTarget?: string }) => {
+  // Smart-mode diagnostic of the pinned source's language policy, without importing WXT storage.
+  const state = (window as any).__readingReview
+  state.execution = state.nodes.map((node: Element) => {
+    const text = getTranslatableText(node)
+    const sourceLang = detectlang(text.replace(/[\s\u3000]+/g, ' ').trim())
+    const targetLang = settings.bidirectionalTranslation && settings.bidirectionalTarget && settings.bidirectionalTarget !== settings.to
+      ? sourceLang === settings.to ? settings.bidirectionalTarget : settings.to : settings.to
+    return { supported: node instanceof HTMLElement, connected: node.isConnected, hasText: Boolean(text.trim()),
+      namespace: node.namespaceURI, sourceLang, targetLang, shouldTranslate: sourceLang !== targetLang }
+  })
+  return state.execution
+}, collectReadingReview: () => {
   const state = (window as any).__readingReview
   const started = performance.now()
   const result = resolveAutoTranslationTarget('smart')

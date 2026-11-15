@@ -5,8 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { paths, readJson, writeJson, jsonFiles, hash, validId, compare, summarize, acceptedIssuesPath, validateAcceptedIssues } from './model.mjs'
 import { browserConfig, openBrowser, closeBrowser, runBrowser, buildCollector, command, fingerprintSources } from './driver.mjs'
 import { replayPayload, replayCode } from './replay.mjs'
-import { pageReviewsDir, validatePageReviews, latestPageReviews, snapshotInputHash, reviewContextHash } from './page-reviews.mjs'
-import { coverage } from './model.mjs'
+import { pageReviewsDir, validatePageReviews, latestPageReviews, snapshotInputHash, reviewContextHash, comparePageExpectation } from './page-reviews.mjs'
 import { extensionRoot } from './adapters/onlytranslate.mjs'
 
 const sha256 = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
@@ -91,6 +90,7 @@ function validateSnapshot(snapshot, group) {
   if(group.pageReview){
     requireValue(group.pageReview.htmlHash===snapshot.htmlHash&&group.pageReview.inputHash===snapshotInputHash(snapshot),'整页确认的快照或元数据已变化：'+group.pageId)
     requireValue(group.pageReview.selectedTextIds.every(id=>texts.has(id)),'整页确认含未知原文定位：'+group.pageId)
+    if(group.pageReview.schemaVersion===2)comparePageExpectation(group.pageReview,snapshot,{targets:group.pageReview.observedSelectedTextIds.map(id=>({textIds:[id]}))},group.decisionHistory)
   }
 }
 
@@ -118,7 +118,7 @@ export async function checkCorpus(options = {}) {
   const p = { ...paths(root, options.dataRoot), ...options.paths }
   const policyPath = options.policyPath || join(root, 'tests/corpus/check-policy.json')
   const id = 'check-' + Date.now() + '-' + randomUUID().slice(0, 8)
-  const report = { schemaVersion: 1, id, startedAt: new Date().toISOString(), ok: false, confirmed: 0, satisfied: 0, violations: 0, acceptedIssues: 0, blockingViolations: 0, confirmedPages:0,pageReviewsSatisfied:0,pageReviewViolations:0,pages: [], errors: [] }
+  const report = { schemaVersion: 1, id, startedAt: new Date().toISOString(), ok: false, confirmed: 0, satisfied: 0, violations: 0, acceptedIssues: 0, blockingViolations: 0, confirmedPages:0,pageReviewsSatisfied:0,pageReviewViolations:0,pageReviewBlockingViolations:0,pageReviewAcceptedIssues:0,pages: [], errors: [] }
   const reportPath = join(p.data, 'checks', id, 'report.json')
   const log = options.log || console.log
   let inputs, runner
@@ -161,14 +161,15 @@ export async function checkCorpus(options = {}) {
           item.status = summary.blockingViolations ? 'violations' : summary.acceptedIssues ? 'accepted-known-issues' : 'passed'
           if(group.pageReview){
             requireValue(result.targets.every(t=>t.textIds.length>0),'整页结果含无原文锚点的目标，不能通过校验')
-            const expected=new Set(group.pageReview.selectedTextIds),actual=coverage(result)
-            const added=[...actual].filter(id=>!expected.has(id)),removed=[...expected].filter(id=>!actual.has(id))
-            const changed=new Set([...added,...removed])
-            const addedSet=new Set(added),removedSet=new Set(removed)
-            item.pageReview={reviewId:group.pageReview.id,addedTextIds:added,removedTextIds:removed,
-              changes:snapshot.catalogue.blocks.filter(b=>b.textIds.some(id=>changed.has(id))).map(b=>({blockId:b.id,text:b.text,added:b.textIds.filter(id=>addedSet.has(id)),removed:b.textIds.filter(id=>removedSet.has(id))}))}
-            if(changed.size){item.status='violations';report.pageReviewViolations++;log(`  [整页需复核] 新增 ${added.length} 个原文片段，减少 ${removed.length} 个`)}
-            else report.pageReviewsSatisfied++
+            const differences=comparePageExpectation(group.pageReview,snapshot,result,group.decisionHistory,inputs.acceptedIssues)
+            item.pageReview={reviewId:group.pageReview.id,...differences}
+            report.pageReviewAcceptedIssues+=differences.acceptedChanges.length
+            if(differences.changes.length){
+              report.pageReviewViolations++
+              if(differences.blockingChanges.length){item.status='violations';report.pageReviewBlockingViolations++}
+              else if(item.status!=='violations')item.status='accepted-known-issues'
+              log(`  [整页期望${differences.blockingChanges.length?'未满足':'含已接受限制'}] 多选 ${differences.addedTextIds.length} 个原文片段，漏选 ${differences.removedTextIds.length} 个`)
+            }else report.pageReviewsSatisfied++
           }
           item.stats = result.stats
           item.elapsedMs = result.elapsedMs
@@ -209,7 +210,7 @@ export async function checkCorpus(options = {}) {
   report.finishedAt = new Date().toISOString()
   await writeJson(reportPath, report)
   log(`人工要求 ${report.confirmed} 项，满足 ${report.satisfied} 项，未满足 ${report.violations} 项（已接受 ${report.acceptedIssues} 项，仍阻断 ${report.blockingViolations} 项）；${report.ok ? '发布检查通过' + (report.acceptedIssues ? '（含已接受的已知限制）' : '') : '未通过，禁止正式构建'}`)
-  if(report.confirmedPages)log(`整页确认 ${report.confirmedPages} 页，目标一致 ${report.pageReviewsSatisfied} 页，需复核 ${report.pageReviewViolations} 页`)
+  if(report.confirmedPages)log(`已完成评审 ${report.confirmedPages} 页，符合整页期望 ${report.pageReviewsSatisfied} 页，未满足 ${report.pageReviewViolations} 页（已接受差异 ${report.pageReviewAcceptedIssues} 处，仍阻断 ${report.pageReviewBlockingViolations} 页）`)
   for (const error of [...report.errors, ...report.pages.flatMap(page => page.errors)]) log(error)
   log('报告：' + reportPath)
   return { ...report, reportPath }

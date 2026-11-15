@@ -5,8 +5,24 @@ import { join, dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { hash } from './model.mjs'
 import { collectorEntry } from './adapters/onlytranslate.mjs'
+import { commandErrorMessage, saveCommandLog, toolError } from './errors.mjs'
 const execute = promisify(execFile)
-export const command = async (name, args, options = {}) => (await execute(name, args, { encoding: 'utf8', maxBuffer: 96 * 1024 * 1024, timeout: 300000, ...options })).stdout
+export async function command(name,args,options={}) {
+  const {logDirectory=process.env.ONLYTRANSLATE_REVIEW_JOB_LOG,...executeOptions}=options
+  const startedAt=new Date().toISOString()
+  let result
+  try { result=await execute(name,args,{encoding:'utf8',maxBuffer:96*1024*1024,timeout:300000,...executeOptions}) }
+  catch(error){
+    let logs={}
+    try{logs=await saveCommandLog(logDirectory,name,args,error,startedAt)}catch(logError){logs.logError=logError.message}
+    const message=commandErrorMessage(error.stdout,error.stderr,error.message)
+    const code=/\b(INPUT_BLOCKED|INPUT_INTERACTION_REQUIRED):/.exec(message)?.[1]||'COMMAND_FAILED'
+    throw toolError(code,message,{...logs,exitCode:error.code,signal:error.signal||null,killed:Boolean(error.killed),
+      httpStatus:Number(/\bHTTP\s+(\d{3})\b/.exec(message)?.[1])||null,command:name,args})
+  }
+  await saveCommandLog(logDirectory,name,args,{...result,code:0},startedAt)
+  return result.stdout
+}
 export async function browserConfig(p, extension, purpose = 'replay') {
   const folder = join(p.root, 'output/playwright/reading-review')
   await mkdir(folder, { recursive: true })
@@ -33,7 +49,7 @@ export async function runBrowser(browser, code) {
   await writeFile(file, code)
   const output = await cli(browser, ['run-code', '--filename', file])
   const found = /### Result\s*\r?\n([\s\S]*?)\r?\n### Ran Playwright code/.exec(output)
-  if (!found) throw new Error(output.slice(0, 1800))
+  if (!found) throw toolError('BROWSER_RESPONSE_INVALID',commandErrorMessage(output,'','浏览器命令没有返回有效结果'),{output:output.slice(0,6000)})
   return JSON.parse(found[1])
 }
 export async function closeBrowser(browser) { await cli(browser, ['close']).catch(()=>{}) }

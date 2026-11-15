@@ -5,6 +5,7 @@ export interface AcceptedIssue { id: string; pageId: string; snapshotId: string;
 export interface Run { snapshotId: string; targets: {textIds:string[]}[] }
 export interface ComparedBlock extends SourceBlock { state:string; oldSelected:number; newSelected:number; added:string[]; removed:string[]; decision:Decision|null; violation:boolean; blockingViolation:boolean; acceptedIssue:AcceptedIssue|null; suspected:boolean }
 export function hash(value: string | Uint8Array): string
+export function paths(root:string,dataRoot?:string):Record<string,string>
 export function readJson(path:string,fallback?:any):Promise<any>
 export function validId(value:unknown):boolean
 export function acceptedIssuesPath(decisionsDir:string):string

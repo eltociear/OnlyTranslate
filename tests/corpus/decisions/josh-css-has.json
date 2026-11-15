@@ -167,5 +167,31 @@
     "updatedAt": "2026-11-11T15:10:56.268Z",
     "id": "753d8dff-d1e8-436e-8828-8c53d7efd390",
     "revision": 13
+  },
+  {
+    "blockId": "e92",
+    "snapshotId": "f725f40a43c530131676b8de",
+    "textHash": "6f146bf66a47a9ce78e1bd43dba6b53cf53bb04c96555bce8b720c09130ea8c9",
+    "verdict": "translate",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-14T14:49:19.454Z",
+    "id": "9279168f-d1ac-43b9-9280-ffc8ca09a039",
+    "revision": 14
+  },
+  {
+    "blockId": "e1064",
+    "snapshotId": "f725f40a43c530131676b8de",
+    "textHash": "d1cd51a2ec6bd7251d82e13ea1bcc14fc08f1ae07daa1e5ba69a630445758d67",
+    "verdict": "translate",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-14T14:49:19.454Z",
+    "id": "9623a09b-e344-4018-b1cb-b8bcb93405b2",
+    "revision": 15
   }
 ]
