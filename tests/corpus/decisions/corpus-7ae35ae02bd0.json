@@ -1,0 +1,28 @@
+[
+  {
+    "blockId": "e398",
+    "snapshotId": "91c89e8e-681b-4820-81a9-4320a2a4e93d",
+    "textHash": "13069992baed7cdf4d4467ba825f651ab17a732d083ed943aac86b22e377ad76",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T12:30:23.710Z",
+    "id": "d84ec50d-8e11-472d-8a94-706edca4ec82",
+    "revision": 1
+  },
+  {
+    "blockId": "e706",
+    "snapshotId": "91c89e8e-681b-4820-81a9-4320a2a4e93d",
+    "textHash": "a145ab342a4a3b94aa05536d099691282a5ef3f4aea2ee1a080ddade2718cfb3",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T12:30:23.710Z",
+    "id": "4b5dd065-9a83-4a87-896f-200f719d9877",
+    "revision": 2
+  }
+]

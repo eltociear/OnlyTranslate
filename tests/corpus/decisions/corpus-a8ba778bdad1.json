@@ -1,0 +1,67 @@
+[
+  {
+    "blockId": "e377",
+    "snapshotId": "1aff7658-1d19-4b03-9a2f-393fedd6de13",
+    "textHash": "a57b08a480b822a0a572b993391c292ede593bf8000b406675b180bbb16260fa",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T11:37:12.037Z",
+    "id": "3dccb5eb-23b6-40d4-a6d5-225a440da794",
+    "revision": 1
+  },
+  {
+    "blockId": "e376",
+    "snapshotId": "1aff7658-1d19-4b03-9a2f-393fedd6de13",
+    "textHash": "c588744679c8bc9e0591abd0957d96cfa663b593aff78bbacd95378fa2a16bf4",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T11:37:12.038Z",
+    "id": "4fe3329b-0ebc-4540-ad1e-e8aa007bc78a",
+    "revision": 2
+  },
+  {
+    "blockId": "e380",
+    "snapshotId": "1aff7658-1d19-4b03-9a2f-393fedd6de13",
+    "textHash": "f4caaa30b2b344af0f765cc07570924f542a34771a98dc0df7cc9014c018e396",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T11:37:12.038Z",
+    "id": "503e4188-f371-40d3-bdb6-1c57c8c49f29",
+    "revision": 3
+  },
+  {
+    "blockId": "e384",
+    "snapshotId": "1aff7658-1d19-4b03-9a2f-393fedd6de13",
+    "textHash": "bd2e42f237b39fc195116b8e1606b7af14daf25b36e918b2341817bf4ddf2fd2",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T11:37:12.038Z",
+    "id": "62e03520-90d0-4346-94e8-7eed3c097316",
+    "revision": 4
+  },
+  {
+    "blockId": "e364",
+    "snapshotId": "181713bd-5984-4cee-b2d5-34b9322ca16f",
+    "textHash": "e9a380d3c0d13bc045631f92c3822297df94c87608df9c4a8554060e1562a113",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T12:29:50.238Z",
+    "id": "b017f20f-a5d9-44a9-90c5-9c8824d91863",
+    "revision": 5
+  }
+]

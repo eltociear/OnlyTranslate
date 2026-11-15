@@ -1,0 +1,15 @@
+[
+  {
+    "blockId": "e209",
+    "snapshotId": "2262dab5-dfa0-46a0-8182-d037c2a652a9",
+    "textHash": "0889c89ed2b66a468d650449e8a050455ad183896b491690f2884ec2f75dd96b",
+    "verdict": "exclude",
+    "note": "",
+    "confirmed": true,
+    "specification": 1,
+    "reviewer": "user",
+    "updatedAt": "2026-11-15T13:08:38.823Z",
+    "id": "dee1cd3b-c082-4f62-84d0-77289f124d0e",
+    "revision": 1
+  }
+]
