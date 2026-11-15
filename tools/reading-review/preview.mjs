@@ -1,4 +1,30 @@
 import { Window } from 'happy-dom'
+import { parse } from 'parse5'
+
+function loadPreviewDocument(document, source) {
+  // Happy DOM's HTML parser truncates the document at SVG <style>. Parse HTML
+  // with the standard tree builder, then create DOM nodes without reparsing it.
+  const copy = node => {
+    if (node.nodeName === '#text') return document.createTextNode(node.value)
+    if (node.nodeName === '#comment') return document.createComment(node.data)
+    if (!node.tagName) return null
+    const element = document.createElementNS(node.namespaceURI, node.tagName)
+    for (const attr of node.attrs) {
+      const name = attr.prefix ? `${attr.prefix}:${attr.name}` : attr.name
+      // A colon in an ordinary HTML attribute does not declare a namespace.
+      if (attr.namespace) element.setAttributeNS(attr.namespace, name, attr.value)
+      else element.setAttribute(attr.name, attr.value)
+    }
+    const container = node.content ? element.content : element
+    for (const child of (node.content || node).childNodes) {
+      const copied = copy(child)
+      if (copied) container.append(copied)
+    }
+    return element
+  }
+  const html = parse(source).childNodes.find(node => node.tagName === 'html')
+  document.replaceChildren(copy(html))
+}
 
 export function previewHtml(source, snapshot, base, states = []) {
   const context = `?page=${encodeURIComponent(snapshot.pageId)}&snapshot=${encodeURIComponent(snapshot.id)}`
@@ -8,10 +34,10 @@ export function previewHtml(source, snapshot, base, states = []) {
     try { return assets.get(new URL(raw, snapshot.url).href) || 'data:,' } catch { return 'data:,' }
   }
   const clean = source.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '').replace(/<link\b[^>]*>/gi, tag => /rel\s*=\s*["']?(?:preload|prefetch|modulepreload)/i.test(tag) ? '' : tag)
-  const window = new Window({ url: snapshot.url, settings: { disableCSSFileLoading: true, disableJavaScriptEvaluation: true, disableJavaScriptFileLoading: true } })
+  const window = new Window({ url: snapshot.url, settings: { disableCSSFileLoading: true, disableJavaScriptEvaluation: true, disableJavaScriptFileLoading: true, disableIframePageLoading: true } })
   try {
-    window.document.write(clean)
     const document = window.document
+    loadPreviewDocument(document, clean)
     document.querySelectorAll('script, base, iframe, object, embed, meta[http-equiv]').forEach(node => node.remove())
     document.querySelectorAll('*').forEach(element => {
       for (const attr of [...element.attributes]) if (/^on/i.test(attr.name) || ['integrity', 'srcset', 'formaction', 'autofocus'].includes(attr.name)) element.removeAttribute(attr.name)

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile, mkdir } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { compare, summarize, validateDecision, writeJson, hash } from '../model.mjs'
@@ -8,7 +8,11 @@ import { previewHtml } from '../preview.mjs'
 import { startServer } from '../server.mjs'
 import { readDrafts, groupDrafts, editDraft, clearSubmitted } from '../ui/drafts.mjs'
 
-const snapshot = { id: 'snapshot-1', pageId: 'sample', url: 'https://example.org/story', assets: [], catalogue: { blocks: [
+const sourceHtml='<html><body><h1>An article title.</h1><p>This paragraph should be translated because it explains<em> the main idea of the article in a complete sentence.</em></p><a>Subscribe now</a></body></html>'
+const snapshot = { id: 'snapshot-1', pageId: 'sample', url: 'https://example.org/story', htmlHash:hash(sourceHtml), assets: [], catalogue: { texts:[
+  {id:'t1',text:'An article title.'},{id:'t2',text:'This paragraph should be translated because it explains'},
+  {id:'t3',text:' the main idea of the article in a complete sentence.'},{id:'t4',text:'Subscribe now'},
+],blocks: [
   { id: 'e1', text: 'An article title.', textIds: ['t1'], visible: true },
   { id: 'e2', text: 'This paragraph should be translated because it explains the main idea of the article in a complete sentence.', textIds: ['t2', 't3'], visible: true },
   { id: 'e3', text: 'Subscribe now', textIds: ['t4'], visible: true },
@@ -68,13 +72,51 @@ describe('reading review coverage and decisions',()=>{
     expect(html).not.toContain('src="https://')
     expect(html).toContain('nonce="reading-review"')
   })
+  it('preserves the article after an SVG stylesheet and still sanitizes later content',()=>{
+    const html=previewHtml(`<html><head><style media="(width >= 600px)">h1 { color: red }</style></head><body>
+      <svg viewBox="0 0 20 20"><style type="text/css">.logo { fill: red }</style><path class="logo" d="M0 0h20v20z"/></svg>
+      <article><h1 data-ot-review-node="e1">The complete article &amp; its title</h1>
+      <p data-ot-review-node="e2" onclick="alert(2)">Body text after the logo.</p>
+      <script>alert(1)</script><iframe src="https://bad.example"></iframe></article></body></html>`,snapshot,'http://127.0.0.1:4188')
+    expect(html).toContain('<h1 data-ot-review-node="e1">The complete article &amp; its title</h1>')
+    expect(html).toContain('Body text after the logo.')
+    expect(html).toContain('.logo { fill: red }')
+    expect(html).toContain('media="(width >= 600px)"')
+    expect(html).toContain('<path class="logo"')
+    expect(html).not.toMatch(/alert\([12]\)|onclick=|<iframe/)
+  })
+  it('preserves SVG namespaces, inline reading content and archived style resources',()=>{
+    const sample={...snapshot,assets:[{url:'https://example.org/logo.png',hash:'logo',type:'image/png'}]}
+    const html=previewHtml(`<html><body><svg xmlns:xlink="http://www.w3.org/1999/xlink">
+      <style>.logo { background: url('/logo.png') }</style><use xlink:href="#logo"/>
+      <foreignObject><div xmlns="http://www.w3.org/1999/xhtml" data-ot-review-node="e2">An inline explanation.</div></foreignObject></svg>
+      <svg><style>.second { fill: blue }</style><path/></svg>
+      <p data-ot-review-node="e3">The final paragraph.</p></body></html>`,sample,'http://127.0.0.1:4188')
+    expect(html).toContain('xlink:href="#logo"')
+    expect(html).toContain('<foreignObject>')
+    expect(html).toContain('data-ot-review-node="e2">An inline explanation.</div>')
+    expect(html).toContain('http://127.0.0.1:4188/assets/logo?page=sample&snapshot=snapshot-1')
+    expect(html).toContain('.second { fill: blue }')
+    expect(html).toContain('data-ot-review-node="e3">The final paragraph.</p>')
+  })
+  it.each([
+    ['svg','sol:category','primary'],
+    ['p','x-on:click','go'],
+    ['p','custom:key:part','value'],
+  ])('preserves the ordinary %s attribute %s without requiring a namespace',(tag,name,value)=>{
+    const html=previewHtml(`<html><body><${tag} data-ot-review-node="e1" ${name}="${value}"></${tag}>
+      <p data-ot-review-node="e2" onclick="alert(1)">Article body remains selectable.</p></body></html>`,snapshot,'http://127.0.0.1:4188')
+    expect(html).toContain(`data-ot-review-node="e1" ${name}="${value}"`)
+    expect(html).toContain('data-ot-review-node="e2">Article body remains selectable.</p>')
+    expect(html).not.toContain('onclick=')
+  })
 })
 
 describe('reading review local API',()=>{
   it('shows an accepted known issue separately while preserving the original verdict',async()=>{
     const folder=await mkdtemp(join(tmpdir(),'reading-review-accepted-')),data=join(folder,'data'),corpus=join(folder,'corpus')
     cleanups.push(()=>rm(folder,{recursive:true,force:true}))
-    const sample={...snapshot,htmlHash:hash('snapshot-source')}
+    const sample={...snapshot}
     const decision={...validateDecision({blockId:'e2',snapshotId:sample.id,verdict:'translate',note:'测试中的原裁决'},sample),id:'original-decision'}
     await writeJson(join(corpus,'pages.json'),{pages:[{id:'sample',name:'Sample',url:sample.url}]})
     await writeJson(join(corpus,'release.json'),{tag:'test'})
@@ -86,6 +128,7 @@ describe('reading review local API',()=>{
     }]})
     await writeJson(join(data,'snapshots/sample/latest.json'),{id:sample.id})
     await writeJson(join(data,'snapshots/sample',sample.id,'snapshot.json'),sample)
+    await writeFile(join(data,'snapshots/sample',sample.id,'source.html'),sourceHtml)
     await writeJson(join(data,'runs/sample/current/run.json'),{id:'current',kind:'candidate',snapshotId:sample.id,status:'complete',createdAt:'2026-11-14',targets:[]})
     const app=await startServer({root:resolve(import.meta.dirname, '../../..'),port:0,dataRoot:data,paths:{manifest:join(corpus,'pages.json'),release:join(corpus,'release.json'),decisions:join(corpus,'decisions')}})
     cleanups.push(()=>app.close())
@@ -101,6 +144,7 @@ describe('reading review local API',()=>{
     await writeJson(join(corpus,'release.json'),{tag:'test'})
     await writeJson(join(data,'snapshots/sample/latest.json'),{id:snapshot.id})
     await writeJson(join(data,'snapshots/sample',snapshot.id,'snapshot.json'),snapshot)
+    await writeFile(join(data,'snapshots/sample',snapshot.id,'source.html'),sourceHtml)
     const saveRun=async(id:string,kind:string,date:string)=>writeJson(join(data,'runs/sample',id,'run.json'),{id,kind,snapshotId:snapshot.id,status:'complete',createdAt:date,targets:[]})
     await saveRun('base-old','baseline','2026-01-01')
     await saveRun('base-current','baseline','2026-01-02')
@@ -139,6 +183,7 @@ describe('reading review local API',()=>{
     await writeJson(join(corpus,'release.json'),{tag:'test'})
     await writeJson(join(data,'snapshots/sample/latest.json'),{id:snapshot.id})
     await writeJson(join(data,'snapshots/sample',snapshot.id,'snapshot.json'),snapshot)
+    await writeFile(join(data,'snapshots/sample',snapshot.id,'source.html'),sourceHtml)
     const app=await startServer({root:resolve(import.meta.dirname, '../../..'),port:0,dataRoot:data,paths:{manifest:join(corpus,'pages.json'),release:join(corpus,'release.json'),decisions:join(corpus,'decisions')}})
     cleanups.push(()=>app.close())
     const headers={'Content-Type':'application/json','X-Reading-Review':'1'}

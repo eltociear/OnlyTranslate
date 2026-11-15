@@ -1,5 +1,5 @@
 import { createServer } from 'node:http'
-import { readFile, mkdir, readdir } from 'node:fs/promises'
+import { readFile, mkdir, readdir, stat } from 'node:fs/promises'
 import { join, resolve, extname } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { paths, readJson, writeJson, validId, compare, summarize, validateDecision, acceptedIssuesPath, validateAcceptedIssues } from './model.mjs'
@@ -17,12 +17,45 @@ export async function startServer(options = {}) {
   for(const dir of [p.data,p.snapshots,p.runs,p.jobs,p.assets,p.decisions])await mkdir(dir,{recursive:true})
   const port=options.port ?? Number(process.env.ONLYTRANSLATE_REVIEW_PORT || 4188)
   const staticRoot=fileURLToPath(new URL('./ui/',import.meta.url))
-  const tasks=await createJobQueue(p),{jobs,enqueue}=tasks,pinTasks=new Map()
+  const tasks=await createJobQueue(p),{jobs,enqueue}=tasks,pinTasks=new Map(),inputChecks=new Map()
   let base, mutation=Promise.resolve()
   const mutate = work => { const next=mutation.then(work);mutation=next.catch(()=>{});return next }
+  async function checkedSnapshot(pageId,snapshotId){
+    const snapshot=await requireSnapshotInput(p,pageId,snapshotId)
+    const texts=snapshot.catalogue?.texts,blocks=snapshot.catalogue?.blocks
+    if(!Array.isArray(texts)||!texts.length||!Array.isArray(blocks)||texts.some(t=>!t||!validId(t.id)||typeof t.text!=='string')
+      ||blocks.some(b=>!b||!validId(b.id)||typeof b.text!=='string'||!Array.isArray(b.textIds)))throw Object.assign(new Error('快照缺少有效原文索引'),{code:'INVALID_SNAPSHOT'})
+    const ids=new Set(texts.map(t=>t.id))
+    if(ids.size!==texts.length||blocks.some(b=>b.textIds.some(id=>!ids.has(id))))throw Object.assign(new Error('快照原文索引不匹配'),{code:'INVALID_SNAPSHOT'})
+    return snapshot
+  }
+  async function snapshotInputState(pageId,snapshotId,snapshot,url){
+    if(!snapshotId){
+      const capture=[...jobs.values()].filter(j=>j.pageId===pageId&&j.type==='capture'&&(!j.requestedUrl||j.requestedUrl===url)).sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)))[0]
+      if(capture&&['failed','blocked','interrupted'].includes(capture.status))return {state:'blocked',valid:false,label:'采集受阻',reason:capture.message||capture.error?.message||(capture.error?.httpStatus?'HTTP '+capture.error.httpStatus:'上次采集未成功，请手动重新采集'),code:capture.error?.code||'CAPTURE_FAILED',jobId:capture.id}
+      return {state:'missing',valid:false,label:'待采集',reason:capture&&['running','queued'].includes(capture.status)?'正在等待采集完成，尚无有效正文快照':'尚未采集页面'}
+    }
+    const folder=join(p.snapshots,pageId,snapshotId)
+    const files=[join(folder,'snapshot.json'),join(folder,'source.html'),join(folder,'validation.json'),...(Array.isArray(snapshot?.assets)?snapshot.assets:[]).map(asset=>join(p.assets,String(asset.hash)))]
+    // Only read-only display is cached. Writes always run checkedSnapshot again.
+    const signature=JSON.stringify(await Promise.all(files.map(async file=>{try{const s=await stat(file);return[file,s.size,s.mtimeMs,s.ctimeMs,s.ino]}catch(error){return[file,error.code]}})))
+    const key=pageId+'/'+snapshotId,cached=inputChecks.get(key)
+    if(cached?.signature===signature)return cached.result
+    const result=(async()=>{
+      try{await checkedSnapshot(pageId,snapshotId);return{state:'valid',valid:true,label:'已采集',reason:null}}
+      catch(error){return{state:'blocked',valid:false,label:'采集受阻',reason:error.message,code:error.code||'INVALID_SNAPSHOT'}}
+    })()
+    inputChecks.set(key,{signature,result});return result
+  }
+  async function batchSnapshot(page){
+    const latest=await readJson(join(p.snapshots,page.id,'latest.json'),null)
+    if(!latest?.id)return {reason:(await snapshotInputState(page.id,null,null,page.url)).reason}
+    try{await checkedSnapshot(page.id,latest.id);return {id:latest.id}}
+    catch(error){return {reason:error.message}}
+  }
   async function allRuns(pageId){
     const folder=join(p.runs,pageId),items=await readdir(folder,{withFileTypes:true}).catch(()=>[])
-    return (await Promise.all(items.filter(f=>f.isDirectory()&&validId(f.name)).map(async f=>{const run=await readJson(join(folder,f.name,'run.json'),null);const validation=await readJson(join(folder,f.name,'validation.json'),null);return run&&validation?.valid===false?{...run,status:'invalid',validation}:run}))).filter(Boolean).sort((a,b)=>a.createdAt.localeCompare(b.createdAt))
+    return (await Promise.all(items.filter(f=>f.isDirectory()&&validId(f.name)).map(async f=>{const run=await readJson(join(folder,f.name,'run.json'),null);const validation=await readJson(join(folder,f.name,'validation.json'),null);return run&&validation?.valid===false?{...run,recordedStatus:run.status,status:'invalid',validation}:run}))).filter(Boolean).sort((a,b)=>a.createdAt.localeCompare(b.createdAt))
   }
   async function baselineSelection(pageId,snapshotId,runs){
     if(!snapshotId)return null
@@ -47,27 +80,31 @@ export async function startServer(options = {}) {
     const latest=await readJson(join(p.snapshots,pageId,'latest.json'),null)
     const snapshotId=query.get('snapshot')||latest?.id
     if(snapshotId&&!validId(snapshotId))throw new Error('无效快照')
-    const snapshot=snapshotId?await readJson(join(p.snapshots,pageId,snapshotId,'snapshot.json')):null
+    const snapshot=snapshotId?await readJson(join(p.snapshots,pageId,snapshotId,'snapshot.json')).catch(()=>null):null
+    const inputState=await snapshotInputState(pageId,snapshotId,snapshot,page.url),blocked=inputState.state==='blocked'
     const folders=await readdir(join(p.snapshots,pageId),{withFileTypes:true}).catch(()=>[])
-    const snapshots=(await Promise.all(folders.filter(f=>f.isDirectory()&&validId(f.name)).map(async f=>{const s=await readJson(join(p.snapshots,pageId,f.name,'snapshot.json'));return{id:s.id,createdAt:s.createdAt,state:s.state}}))).sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||''))
-    const runs=(await allRuns(pageId)).filter(r=>r.snapshotId===snapshotId)
-    const selection=await baselineSelection(pageId,snapshotId,runs)
+    const snapshots=(await Promise.all(folders.filter(f=>f.isDirectory()&&validId(f.name)).map(async f=>{const s=await readJson(join(p.snapshots,pageId,f.name,'snapshot.json')).catch(()=>null);return{id:f.name,createdAt:s?.createdAt,state:s?.state||'invalid'}}))).sort((a,b)=>(a.createdAt||'').localeCompare(b.createdAt||''))
+    if(snapshotId&&!snapshots.some(s=>s.id===snapshotId))snapshots.push({id:snapshotId,state:'invalid'})
+    const runs=(await allRuns(pageId)).filter(r=>r.snapshotId===snapshotId).map(run=>blocked?{...run,recordedStatus:run.recordedStatus||run.status,status:'invalid',validation:{valid:false,source:'snapshot-input',reason:inputState.reason}}:run)
+    const selection=blocked?null:await baselineSelection(pageId,snapshotId,runs)
     const select=(parameter,kind)=>{
       const id=query.get(parameter)
-      if(id){const found=runs.find(run=>run.id===id);if(!found)throw new Error('运行不属于该快照');if(found.kind!==kind)throw new Error('运行类型与对比位置不匹配');if(found.status!=='complete')throw new Error('该运行未通过完整性校验');return found}
+      if(id){const found=runs.find(run=>run.id===id);if(!found)throw new Error('运行不属于该快照');if(found.kind!==kind)throw new Error('运行类型与对比位置不匹配');if(blocked)return null;if(found.status!=='complete')throw new Error('该运行未通过完整性校验');return found}
+      if(blocked)return null
       if(kind==='baseline')return runs.find(run=>run.id===selection?.baselineRunId&&run.kind==='baseline'&&run.status==='complete')||null
       return runs.findLast(run=>run.kind===kind&&run.status==='complete')||null
     }
     const before=select('before','baseline'),after=select('after','candidate')
     const decisions=await readJson(join(p.decisions,pageId+'.json'),[])
     const acceptedIssues=validateAcceptedIssues(await readJson(acceptedIssuesPath(p.decisions),{schemaVersion:1,issues:[]}))
-    const blocks=snapshot?compare(snapshot,before,after,decisions,acceptedIssues):[]
+    const blocks=snapshot&&!blocked?compare(snapshot,before,after,decisions,acceptedIssues):[]
     const policy=await readJson(resolve(p.decisions,'../check-policy.json'),{annotationPolicyVersion:null})
     const reviewHistory=await loadPageReviews(p.decisions,pageId)
     const pageReview=pageReviewState({snapshot,run:after,history:reviewHistory,decisions,acceptedIssues,specification:policy.annotationPolicyVersion})
+    if(blocked)Object.assign(pageReview,{state:'blocked',label:'采集受阻',canConfirm:false,reason:inputState.reason+'；请重新采集有效正文后再评审',validation:{state:'unavailable',label:'快照无效，无法评测',blockingBlocks:[],violations:0,acceptedIssues:0}})
     const changed=new Set([...pageReview.addedTextIds,...pageReview.removedTextIds])
     const repairs=new Set(pageReview.validation.blockingBlocks)
-    return {page,snapshot,snapshots,runs,before,after,baselineSelection:selection,blocks:blocks.map(b=>({...b,pageReviewChanged:b.textIds.some(id=>changed.has(id)),repairNeeded:repairs.has(b.id)})),summary:summarize(blocks),decisions,pageReview}
+    return {page,snapshotId,snapshot,inputState,snapshots,runs,before,after,baselineSelection:selection,blocks:blocks.map(b=>({...b,pageReviewChanged:b.textIds.some(id=>changed.has(id)),repairNeeded:repairs.has(b.id)})),summary:blocked?null:summarize(blocks),decisions,pageReview}
   }
   const send=(response,status,value,type='application/json; charset=utf-8')=>{response.writeHead(status,{'Content-Type':type,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});response.end(type.startsWith('application/json')?JSON.stringify(value):value)}
   async function body(request){let text='';for await(const part of request){text+=part;if(text.length>2*1024*1024)throw new Error('请求过大')}return JSON.parse(text||'{}')}
@@ -83,22 +120,17 @@ export async function startServer(options = {}) {
         if(retryJob)return send(response,202,await tasks.retry(retryJob[1]))
         if(path==='/api/candidate-all'){
           const queued=[],skipped=[]
-          for(const page of (await readJson(p.manifest)).pages){const latest=await readJson(join(p.snapshots,page.id,'latest.json'),null);if(latest)queued.push(await enqueue('candidate',page.id,latest.id));else skipped.push({pageId:page.id,reason:'尚未采集'})}
+          for(const page of (await readJson(p.manifest)).pages){const snapshot=await batchSnapshot(page);if(snapshot.id)queued.push(await enqueue('candidate',page.id,snapshot.id));else skipped.push({pageId:page.id,reason:snapshot.reason})}
           return send(response,202,{queued,skipped})
         }
         if(path==='/api/pilot'){
           const created=[],skipped=[]
           for(const page of (await readJson(p.manifest)).pages){
-            const latest=await readJson(join(p.snapshots,page.id,'latest.json'),null)
-            if(!latest){
-              const previous=[...jobs.values()].filter(j=>j.pageId===page.id&&j.type==='capture').sort((a,b)=>b.createdAt.localeCompare(a.createdAt))[0]
-              if(previous?.requestedUrl===page.url&&(['INPUT_BLOCKED','INPUT_INTERACTION_REQUIRED'].includes(previous.error?.code)||(previous.error?.httpStatus>=400&&previous.error.httpStatus<500))){skipped.push({pageId:page.id,reason:'上次采集为受限输入，请核对网址或手动重试'});continue}
-              const capture=await enqueue('capture',page.id);created.push(capture);for(const type of ['baseline','candidate'])created.push(await enqueue(type,page.id,undefined,capture.id));continue
-            }
-            try{await requireSnapshotInput(p,page.id,latest.id)}catch(error){skipped.push({pageId:page.id,reason:error.message});continue}
-            const runs=(await allRuns(page.id)).filter(r=>r.snapshotId===latest.id&&r.status==='complete')
-            if(!runs.some(r=>r.kind==='baseline'))created.push(await enqueue('baseline',page.id,latest.id))
-            if(!runs.some(r=>r.kind==='candidate'))created.push(await enqueue('candidate',page.id,latest.id))
+            const snapshot=await batchSnapshot(page)
+            if(!snapshot.id){skipped.push({pageId:page.id,reason:snapshot.reason});continue}
+            const runs=(await allRuns(page.id)).filter(r=>r.snapshotId===snapshot.id&&r.status==='complete')
+            if(!runs.some(r=>r.kind==='baseline'))created.push(await enqueue('baseline',page.id,snapshot.id))
+            if(!runs.some(r=>r.kind==='candidate'))created.push(await enqueue('candidate',page.id,snapshot.id))
           }
           return send(response,202,{queued:created,skipped})
         }
@@ -112,6 +144,7 @@ export async function startServer(options = {}) {
         })
         const pin=/^\/api\/baseline-selection\/([^/]+)$/.exec(path)
         if(pin)return await mutate(async()=>{
+          await checkedSnapshot(pin[1],input.snapshotId)
           const d=await detail(pin[1],new URLSearchParams({snapshot:input.snapshotId}))
           const run=d.runs.find(run=>run.id===input.runId&&run.kind==='baseline'&&run.status==='complete')
           if(!run)throw new Error('只能固定当前快照中完整有效的发布版基线')
@@ -123,6 +156,7 @@ export async function startServer(options = {}) {
         const whole=/^\/api\/page-reviews\/([^/]+)$/.exec(path)
         if(whole)return await mutate(async()=>{
           if(!['confirmed','revoked'].includes(input.status)||!validId(input.snapshotId))throw new Error('无效整页确认请求')
+          if(input.status==='confirmed')await checkedSnapshot(whole[1],input.snapshotId)
           const query=new URLSearchParams({snapshot:input.snapshotId})
           let d=await detail(whole[1],query)
           if(d.snapshot?.pageId!==d.page.id)throw new Error('整页确认的快照页面身份不匹配')
@@ -161,6 +195,7 @@ export async function startServer(options = {}) {
           if(new Set(items.map(item=>item.blockId)).size!==items.length)throw new Error('一批中不能重复保存同一文字块')
           const snapshotId=items[0].snapshotId
           if(items.some(item=>item.snapshotId!==snapshotId))throw new Error('一批裁决必须属于同一快照')
+          await checkedSnapshot(match[1],snapshotId)
           const d=await detail(match[1],new URLSearchParams({snapshot:snapshotId}))
           const file=join(p.decisions,match[1]+'.json'),history=await readJson(file,[])
           // Validate the whole batch before a single atomic history write.
@@ -188,7 +223,7 @@ export async function startServer(options = {}) {
       }
       if(path==='/api/state'){
         const manifest=await readJson(p.manifest),pages=[]
-        for(const item of manifest.pages){const d=await detail(item.id);pages.push({...item,snapshotId:d.snapshot?.id,resourceWarnings:d.snapshot?.omittedAssets||0,summary:d.summary,pageReview:d.pageReview,before:d.before?{id:d.before.id,status:d.before.status,targets:d.before.targets.length,translation:d.before.translation}:null,after:d.after?{id:d.after.id,targets:d.after.targets.length}:null})}
+        for(const item of manifest.pages){const d=await detail(item.id);pages.push({...item,snapshotId:d.snapshotId,inputState:d.inputState,resourceWarnings:d.snapshot?.omittedAssets||0,summary:d.summary,pageReview:d.pageReview,before:d.before?{id:d.before.id,status:d.before.status,targets:d.before.targets.length,translation:d.before.translation}:null,after:d.after?{id:d.after.id,targets:d.after.targets.length}:null})}
         const currentJobs=await Promise.all([...jobs.keys()].map(id=>readJson(join(p.jobs,id+'.json'))))
         return send(response,200,{pages,jobs:currentJobs.reverse(),release:await readJson(p.release),dataRoot:p.data,decisionsRoot:p.decisions})
       }
@@ -197,6 +232,7 @@ export async function startServer(options = {}) {
       const preview=/^\/preview\/([^/]+)$/.exec(path)
       if(preview){
         const d=await detail(preview[1],url.searchParams)
+        if(d.inputState.state==='blocked')throw new Error('采集受阻：'+d.inputState.reason)
         if(!d.snapshot)throw new Error('请先采集页面')
         let html=await readFile(join(p.snapshots,d.page.id,d.snapshot.id,'source.html'),'utf8')
         if(url.searchParams.get('translated')==='1'&&d.before)html=await readFile(join(p.runs,d.page.id,d.before.id,'translated.html'),'utf8')
@@ -217,7 +253,7 @@ export async function startServer(options = {}) {
         const data=await readFile(join(p.assets,asset[1]))
         return send(response,200,descriptor.type.includes('css')?rewriteCss(data.toString(),descriptor.url,snapshot.assets,base,url.search):data,descriptor.type)
       }
-      const files={'/':'index.html','/app.js':'app.js','/drafts.mjs':'drafts.mjs','/style.css':'style.css'}
+      const files={'/':'index.html','/app.js':'app.js','/drafts.mjs':'drafts.mjs','/lists.mjs':'lists.mjs','/style.css':'style.css'}
       if(files[path])return send(response,200,await readFile(join(staticRoot,files[path])),/\.m?js$/.test(path)?'text/javascript; charset=utf-8':path.endsWith('.css')?'text/css; charset=utf-8':'text/html; charset=utf-8')
       return send(response,404,{error:'页面不存在'})
     }catch(error){console.error(error.message);return send(response,error.status===409?409:400,{error:error.message})}

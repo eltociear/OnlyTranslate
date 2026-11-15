@@ -12,7 +12,7 @@ export function pageInputIssue(title, bodyText) {
 }
 export function inspectInputHTML(html,url) {
   const clean=html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi,'').replace(/<link\b[^>]*>/gi,'')
-  const window=new Window({url,settings:{disableCSSFileLoading:true,disableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true}})
+  const window=new Window({url,settings:{disableCSSFileLoading:true,disableJavaScriptEvaluation:true,disableJavaScriptFileLoading:true,disableIframePageLoading:true}})
   try {
     window.document.write(clean)
     window.document.querySelectorAll('style,noscript,template').forEach(n=>n.remove())

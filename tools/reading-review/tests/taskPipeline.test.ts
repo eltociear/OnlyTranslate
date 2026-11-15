@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { Window } from 'happy-dom'
@@ -24,12 +24,14 @@ async function fixture(execute:any){
     await writeJson(join(p.snapshots,'sample/latest.json'),{id});return s
   }
   const wait=async(...ids:string[])=>{
-    for(let i=0;i<200;i++){
-      const jobs=await Promise.all(ids.map(id=>readJson(join(p.jobs,id+'.json'))))
+    const deadline=Date.now()+4000
+    let jobs:any[]=[]
+    while(Date.now()<deadline){
+      jobs=await Promise.all(ids.map(id=>readJson(join(p.jobs,id+'.json'))))
       if(jobs.every(j=>!['queued','running'].includes(j.status)))return jobs
-      await new Promise(resolve=>setTimeout(resolve,10))
+      await new Promise(resolve=>setTimeout(resolve,20))
     }
-    throw new Error('queue did not settle')
+    throw new Error('queue did not settle: '+JSON.stringify(jobs.map(job=>({id:job.id,status:job.status,message:job.message}))))
   }
   return {p,queue,snapshot,wait}
 }
@@ -136,7 +138,7 @@ it('builds and executes diagnostics without WXT storage and keeps source collect
 it('exposes bounded task logs and skips blocked inputs in batch requests without inventing successful runs',async()=>{
   const folder=await mkdtemp(join(tmpdir(),'review-task-api-')),p=paths(folder,join(folder,'data'))
   cleanups.push(()=>rm(folder,{recursive:true,force:true}))
-  const pages=[{id:'http-error',url:'https://example.org/missing'},{id:'captcha',url:'https://example.org/challenge'}]
+  const pages=[{id:'http-error',url:'https://example.org/missing'},{id:'captcha',url:'https://example.org/challenge'},{id:'uncaptured',url:'https://example.org/new'}]
   await writeJson(p.manifest,{schemaVersion:1,pages})
   const job={id:'failed-capture',pageId:'http-error',type:'capture',requestedUrl:pages[0].url,status:'failed',createdAt:'2026-01-01',error:{code:'COMMAND_FAILED',httpStatus:404}}
   await writeJson(join(p.jobs,job.id+'.json'),job)
@@ -155,7 +157,14 @@ it('exposes bounded task logs and skips blocked inputs in batch requests without
   expect(response.status).toBe(202)
   const batch=await response.json()
   expect(batch.queued).toEqual([])
-  expect(batch.skipped.map((item:any)=>item.pageId)).toEqual(['http-error','captcha'])
+  expect(batch.skipped.map((item:any)=>item.pageId)).toEqual(['http-error','captcha','uncaptured'])
+  const before=await readdir(p.jobs)
+  for(const endpoint of ['/api/pilot','/api/candidate-all','/api/pilot','/api/candidate-all']){
+    const again=await(await fetch(app.base+endpoint,{method:'POST',headers:{'Content-Type':'application/json','X-Reading-Review':'1'},body:'{}'})).json()
+    expect(again.queued).toEqual([])
+    expect(again.skipped.map((item:any)=>item.pageId)).toEqual(['http-error','captcha','uncaptured'])
+  }
+  expect(await readdir(p.jobs)).toEqual(before)
   const log=await(await fetch(app.base+'/api/jobs/failed-capture/log')).json()
   expect(log).toMatchObject({error:{httpStatus:404},stderr:'actual stderr',truncatedTo:24000})
   expect(log.stdout).toHaveLength(24000)

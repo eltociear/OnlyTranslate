@@ -118,6 +118,9 @@ importers:
       happy-dom:
         specifier: ^20.11.2
         version: 20.11.2
+      parse5:
+        specifier: ^7.3.0
+        version: 7.3.0
     devDependencies:
       '@types/node':
         specifier: ^22.12.0
